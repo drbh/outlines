@@ -1,5 +1,8 @@
+import os
+import threading
 from collections import namedtuple
 from functools import lru_cache
+from queue import Queue
 from typing import TYPE_CHECKING, Dict, Generator, List, Sequence, Set, Tuple
 
 import numba
@@ -224,6 +227,7 @@ def make_deterministic_fsm(fsm: FSM) -> Tuple[BetterFSM, Dict[int, int]]:
 
 @numba.njit(nogil=True, cache=True)
 def _walk_fsm(
+    accepted_states: List[int],
     fsm_transitions: Dict[Tuple[int, int], int],
     alphabet_symbol_mapping: Dict[str, int],
     alphabet_anything_value: int,
@@ -231,10 +235,10 @@ def _walk_fsm(
     fsm_finals: Set[int],
     input_string: str,
     start_state: int,
+    empty: List[int],
     full_match: bool = True,
 ) -> List[int]:
     state = start_state
-    accepted_states: List[int] = numba.typed.List.empty_list(numba.int64)
     last_final_idx: int = numba.uint64(0)
 
     for i, symbol in enumerate(input_string):
@@ -246,17 +250,17 @@ def _walk_fsm(
             if not full_match and last_final_idx > 0:
                 return accepted_states[:last_final_idx]
 
-            return numba.typed.List.empty_list(numba.int64)
+            return empty
 
         state = new_state
 
         if state in fsm_finals:
             last_final_idx = numba.uint64(i + 1)
 
-        accepted_states.append(_nonoptional(state))
+        accepted_states[i] = _nonoptional(state)
 
     if full_match and last_final_idx - 1 != i:
-        return numba.typed.List.empty_list(numba.int64)
+        return empty
 
     return accepted_states
 
@@ -465,13 +469,20 @@ def state_scan_tokens(
     alphabet_anything_value: int,
     fsm_initial: int,
     fsm_finals: Set[int],
-    vocabulary: Dict[str, List[int]],
+    vocabulary: Tuple[numba.typed.List, numba.typed.List, numba.typed.List],
     start_state: int,
+    empty: List[int],
 ) -> Set[Tuple[int, int]]:
     res = set()
-
-    for token, token_ids in vocabulary.items():
+    start_offset = 0
+    for i in range(len(vocabulary[0])):
+        token = vocabulary[0][i]
+        offset = vocabulary[2][i]
+        token_ids = vocabulary[1][start_offset : start_offset + offset]
+        start_offset += offset
+        accepted_states = numba.typed.List([0] * len(token))
         state_seq = _walk_fsm(
+            accepted_states,
             fsm_transitions,
             alphabet_symbol_mapping,
             alphabet_anything_value,
@@ -479,6 +490,7 @@ def state_scan_tokens(
             fsm_finals,
             token,
             start_state,
+            empty,
             False,
         )
 
@@ -491,52 +503,72 @@ def state_scan_tokens(
     return res
 
 
-def create_fsm_index_end_to_end(
-    fsm_info: FSMInfo,
-    vocabulary: Dict[str, List[int]],
-) -> Dict[int, Set[Tuple[int, int]]]:
-    """Create an FSM state-to-vocabulary map/index through end-to-end token parsing."""
+def create_fsm_index_end_to_end(fsm_info, vocabulary):
+    # we only want to use a few cpus at most since the work is largely sequential and the
+    # more cpus just adds overhead instead of speeding up the process
+    num_cpus = os.cpu_count()
+    num_workers = min(num_cpus, 8)
+    states_to_token_subsets = []
+    seen = set()
+    queue = Queue()
+    queue.put(fsm_info.initial)
 
-    # TODO: Consider using a `List` of `Set`s instead; that way we can JIT this
-    # code, too.
-    states_to_token_subsets: Dict[int, Set[Tuple[int, int]]] = {}
-    seen: Set[int] = set()
-    next_states = {fsm_info.initial}
+    # initialize an empty list once and reuse it
+    empty = numba.typed.List.empty_list(numba.int64)
 
-    while next_states:
-        start_state = next_states.pop()
+    def worker():
+        while True:
+            start_state = queue.get()
+            if start_state is None:
+                break
 
-        token_ids_end_states = state_scan_tokens(
-            fsm_info.transitions,
-            fsm_info.alphabet_symbol_mapping,
-            fsm_info.alphabet_anything_value,
-            fsm_info.initial,
-            fsm_info.finals,
-            vocabulary,
-            start_state,
-        )
+            if start_state not in seen:
+                token_ids_end_states = state_scan_tokens(
+                    fsm_info.transitions,
+                    fsm_info.alphabet_symbol_mapping,
+                    fsm_info.alphabet_anything_value,
+                    fsm_info.initial,
+                    fsm_info.finals,
+                    vocabulary,
+                    start_state,
+                    empty,
+                )
+                for token_id_and_end_state in token_ids_end_states:
+                    states_to_token_subsets.append(
+                        (start_state, token_id_and_end_state)
+                    )
+                    end_state = token_id_and_end_state[1]
+                    if end_state not in seen and end_state not in queue.queue:
+                        queue.put(end_state)
 
-        for token_id_and_end_state in token_ids_end_states:
-            states_to_token_subsets.setdefault(start_state, set()).add(
-                token_id_and_end_state
-            )
-            end_state = token_id_and_end_state[1]
-            if end_state not in seen:
-                next_states.add(end_state)
+                seen.add(start_state)
+            queue.task_done()
 
-        seen.add(start_state)
+    workers = []
+    for _ in range(num_workers):
+        t = threading.Thread(target=worker)
+        workers.append(t)
+        t.start()
 
-    return states_to_token_subsets
+    # block until all tasks are done and then stop the workers
+    queue.join()
+    for _ in range(num_workers):
+        queue.put(None)
+    for t in workers:
+        t.join()
+
+    result: Dict[int, Set[int]] = {}
+    for state, token_id_and_end_state in states_to_token_subsets:
+        result.setdefault(state, set()).add(token_id_and_end_state)
+
+    return result
 
 
-# TODO: Cannot cache typed collections to disk, yet.  See
-# https://github.com/numba/numba/issues/4698
+# prefer returing a tuple of lists instead of a numba dict
 @lru_cache
 def reduced_vocabulary(tokenizer: "Tokenizer"):
     """Create a map from decoded vocabulary tokens to lists of equivalent token ids."""
-    vocabulary = numba.typed.Dict.empty(
-        numba.types.string, numba.types.ListType(numba.int64)
-    )
+    vocabulary: Dict[str, List[int]] = {}
     empty_token_ids = set()
     for token, token_idx in tokenizer.vocabulary.items():
         if token in tokenizer.special_tokens:
@@ -545,14 +577,23 @@ def reduced_vocabulary(tokenizer: "Tokenizer"):
         token_str = tokenizer.convert_token_to_string(token)
 
         if token_str:
-            vocabulary.setdefault(
-                token_str,
-                numba.typed.List.empty_list(numba.int64),
-            ).append(numba.int64(token_idx))
+            if token_str in vocabulary:
+                vocabulary[token_str].append(token_idx)
+            else:
+                vocabulary[token_str] = [token_idx]
         else:
-            empty_token_ids.add(numba.int64(token_idx))
+            empty_token_ids.add(token_idx)
 
-    return vocabulary, empty_token_ids
+    token_strs = numba.typed.List.empty_list(numba.types.string)
+    token_ids = numba.typed.List.empty_list(numba.types.int64)
+    offsets = numba.typed.List.empty_list(numba.types.int64)
+
+    for token_str, token_id_list in vocabulary.items():
+        token_strs.append(token_str)
+        token_ids.extend(token_id_list)
+        offsets.append(len(token_id_list))
+
+    return (token_strs, token_ids, offsets), empty_token_ids
 
 
 def create_fsm_index_tokenizer(

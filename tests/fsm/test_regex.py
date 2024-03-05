@@ -21,7 +21,14 @@ def walk_fsm_numba(
     start_state: int,
     full_match: bool = True,
 ):
+    # initialize the list with the same length as the input string
+    accepted_states = numba.typed.List([0] * len(input_string))
+
+    # initialize an empty list once and reuse it
+    empty = numba.typed.List.empty_list(numba.int64)
+
     return _walk_fsm(
+        accepted_states,
         fsm.fsm_info.transitions,
         fsm.fsm_info.alphabet_symbol_mapping,
         fsm.fsm_info.alphabet_anything_value,
@@ -29,6 +36,7 @@ def walk_fsm_numba(
         fsm.fsm_info.finals,
         input_string,
         start_state,
+        empty=empty,
         full_match=full_match,
     )
 
@@ -252,10 +260,21 @@ def test_create_fsm_index_end_to_end():
         "<EOS>": numba.typed.List([4]),
     }
 
-    vocabulary_nb = numba.typed.Dict.empty(
-        numba.types.string, numba.types.ListType(numba.int64)
+    token_strs = []
+    token_ids = []
+    offsets = []
+    for token_str, token_id in vocabulary.items():
+        token_strs.append(token_str)
+        token_ids.extend(token_id)
+        offsets.append(len(token_id))
+
+    vocabulary_nb = (token_strs, token_ids, offsets)
+
+    assert vocabulary_nb == (
+        ["blah", "1a", "2", "0", "<EOS>"],
+        [0, 1, 2, 3, 4],
+        [1, 1, 1, 1, 1],
     )
-    vocabulary_nb.update(vocabulary)
 
     res = create_fsm_index_end_to_end(regex_fsm.fsm_info, vocabulary_nb)
 
